@@ -488,6 +488,16 @@ class GradioConfig(BaseModel):
     gradio_temperature: Optional[float] = None
 
 
+class MedusaConfig(BaseModel):
+    medusa_num_heads: Optional[int] = None
+    medusa_num_layers: Optional[int] = None
+    medusa_heads_coefficient: Optional[float] = None
+    medusa_decay_coefficient: Optional[float] = None
+    medusa_logging: Optional[bool] = None
+    medusa_scheduler: Optional[str] = None
+    medusa_lr_multiplier: Optional[float] = None
+    medusa_only_heads: Optional[bool] = None
+
 # pylint: disable=too-many-public-methods,too-many-ancestors
 class AxolotlInputConfig(
     ModelInputConfig,
@@ -499,6 +509,7 @@ class AxolotlInputConfig(
     MLFlowConfig,
     LISAConfig,
     GradioConfig,
+    MedusaConfig,
     RemappedParameters,
     DeprecatedParameters,
     BaseModel,

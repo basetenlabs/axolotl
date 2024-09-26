@@ -47,6 +47,12 @@ from axolotl.prompt_tokenizers import LLAMA_DEFAULT_EOS_TOKEN
 from axolotl.utils.bench import log_gpu_memory_usage
 from axolotl.utils.chat_templates import chat_templates
 from axolotl.utils.dict import DictDefault
+# BASETEN ctl
+from axolotl.monkeypatch.medusa_utils import (
+    replace_compute_loss,
+    add_medusa_heads,
+    replace_create_optimizer,
+)
 from axolotl.utils.distributed import zero_only
 from axolotl.utils.gradient_checkpointing import hf_grad_checkpoint_unsloth_wrapper
 from axolotl.utils.lora_embeddings import get_linear_embedding_layers
@@ -747,6 +753,50 @@ def load_model(
     if isinstance(model, (PeftModel, PeftModelForCausalLM)) and not qlora_fsdp:
         model = model.merge_and_unload()
 
+    # BASETEN ctl
+    # Dequantize for qlora
+    # Adapt from https://gist.github.com/ChrisHayduk/1a53463331f52dca205e55982baf9930
+    if cfg.merge_lora and cfg.adapter == "qlora" and cfg.load_in_4bit:
+        import copy
+        from bitsandbytes.functional import dequantize_4bit
+        from peft.utils import _get_submodules
+
+        LOG.info("dequantizing qlora model")
+        dtype = torch.float16
+        device = model.device
+        with torch.no_grad():
+            for name, module in model.named_modules():
+                if isinstance(module, bnb.nn.Linear4bit):
+                    # LOG.info(f"Dequantizing `{name}`...")
+                    quant_state = copy.deepcopy(module.weight.quant_state)
+
+                    quant_state[2] = dtype
+
+                    weights = dequantize_4bit(
+                        module.weight.data, quant_state=quant_state, quant_type="nf4"
+                    ).to(dtype)
+
+                    new_module = torch.nn.Linear(
+                        module.in_features, module.out_features, bias=None, dtype=dtype
+                    )
+                    new_module.weight = torch.nn.Parameter(weights)
+                    new_module.to(device=device, dtype=dtype)
+
+                    parent, target, target_name = _get_submodules(model, name)
+                    setattr(parent, target_name, new_module)
+                    del module
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            model.is_loaded_in_4bit = False
+            model.quantization_method = None
+            model.is_quantized = False
+            delattr(model.config, "quantization_config")
+            # If your model is too large, you may need to call `model.cpu()` to merge on CPU
+            model.to("cpu")
+
+
     embeddings_len = (
         math.ceil(len(tokenizer) / 32) * 32
         if cfg.resize_token_embeddings_to_32x
@@ -863,6 +913,95 @@ def load_model(
                 if hasattr(module, "weight"):
                     module.to(cfg.torch_dtype)
 
+
+    # BASETEN ctl
+    if cfg.logging_topk is not None:
+        import wandb
+
+        def compute_loss(self, model, inputs, return_outputs=False):
+            outputs = model(**inputs)
+            logits = outputs.logits
+            labels = inputs["labels"]
+            loss = outputs.loss
+
+            logs = {}
+
+            # shift
+            logits = logits[..., :-1, :].contiguous()
+            labels = labels[..., 1:].contiguous()
+            not_ignore_mask = labels != -100
+
+            for k in range(1, cfg.logging_topk + 1):
+                # compute top-k accuracy
+                _, topk_indices = logits.topk(k, dim=-1)
+                correct = topk_indices == labels.unsqueeze(-1)
+                correct = correct.sum(-1)
+                correct = correct.masked_select(not_ignore_mask).sum()
+                accuracy = correct.float() / not_ignore_mask.sum()
+                logs[f"top_{k}"] = accuracy
+
+            if model.training:
+                prefix = "train"
+            else:
+                prefix = "eval"
+
+            logs = {f"{prefix}/{k}": v for k, v in logs.items()}
+            if self.state.is_world_process_zero:
+                wandb.log(
+                    {
+                        **logs,
+                        "train/global_step": self.state.global_step,
+                    }
+                )
+
+            return (loss, outputs) if return_outputs else loss
+        transformers.trainer.Trainer.compute_loss = compute_loss
+
+    # Add support for Medusa (https://github.com/FasterDecoding/Medusa)
+    if cfg.medusa_num_heads is not None:
+        from transformers import LlamaForCausalLM, MistralForCausalLM
+
+        assert isinstance(
+            model, (LlamaForCausalLM, MistralForCausalLM)
+        ), "Medusa is only supported for Llama and Mistral models for now"
+
+        LOG.info(
+            f"using Medusa with {cfg.medusa_num_heads} heads, {cfg.medusa_num_layers} layers, {cfg.medusa_decay_coefficient} decay coefficient, {cfg.medusa_heads_coefficient} heads coefficient, {cfg.medusa_scheduler} scheduler, {cfg.medusa_logging} logging"
+        )
+
+        add_medusa_heads(
+            model,
+            medusa_num_heads=cfg.medusa_num_heads,
+            medusa_num_layers=cfg.medusa_num_layers,
+        )
+
+        replace_compute_loss(
+            medusa_heads_coefficient=cfg.medusa_heads_coefficient,
+            medusa_decay_coefficient=cfg.medusa_decay_coefficient,
+            medusa_scheduler=cfg.medusa_scheduler,
+            medusa_logging=cfg.medusa_logging,
+            medusa_only_heads=cfg.medusa_only_heads,
+            medusa_distillation_regularization=cfg.medusa_distillation_regularization,
+            medusa_self_distillation=cfg.medusa_self_distillation,
+        )
+
+        if cfg.medusa_lr_multiplier != 1:
+            LOG.info(f"Using Medusa LR multiplier {cfg.medusa_lr_multiplier}")
+            replace_create_optimizer(
+                medusa_lr_multiplier=cfg.medusa_lr_multiplier,
+            )
+
+        if cfg.adapter in ["lora", "qlora"]:
+            # Add medusa heads to cfg.lora_modules_to_save
+            if cfg.lora_modules_to_save is None:
+                cfg.lora_modules_to_save = []
+            for i in range(cfg.medusa_num_heads):
+                cfg.lora_modules_to_save.append(f"medusa_head.{i}")
+            # for name, module in model.medusa_head.named_modules():
+            #     if isinstance(module, torch.nn.Linear):
+            #         cfg.lora_modules_to_save.append(f"medusa_head.{name}")
+            # cfg.lora_modules_to_save.append("lm_head")
+
     lora_config = None
     if not reference_model or cfg.lora_model_dir:
         # if we're not loading the reference model, then we're loading the model for training
@@ -874,6 +1013,40 @@ def load_model(
 
     if is_deepspeed_zero3_enabled():
         skip_move_to_device = True
+
+    # BASETEN ctl
+    if cfg.medusa_num_heads is not None and (
+        cfg.medusa_only_heads or cfg.medusa_num_unfreeze_layers > 0
+    ):
+        LOG.info("Freeze layers!")
+        for param in model.parameters():
+            param.requires_grad = False
+        # Leave the last medusa_num_unfreeze_layers layers trainable
+        if cfg.medusa_num_unfreeze_layers > 0:
+            for layer in model.model.layers[-cfg.medusa_num_unfreeze_layers :]:
+                LOG.info(f"Unfreezing layer {layer}")
+                for param in layer.parameters():
+                    param.requires_grad = True
+            # Leave the last medusa_num_unfreeze_layers layers trainable to ensure the gradient can pass through
+            for param in model.model.norm.parameters():
+                param.requires_grad = True
+
+        for param in model.medusa_head.parameters():
+            param.requires_grad = True
+
+        if not cfg.medusa_only_heads:
+            for param in model.lm_head.parameters():
+                param.requires_grad = True
+
+        if cfg.gradient_checkpointing:
+            # https://github.com/huggingface/transformers/issues/21381#issuecomment-1666498410
+            from functools import partial
+
+            notfailing_checkpoint = partial(
+                torch.utils.checkpoint.checkpoint, use_reentrant=False
+            )
+            torch.utils.checkpoint.checkpoint = notfailing_checkpoint
+
 
     if (
         cfg.ddp
