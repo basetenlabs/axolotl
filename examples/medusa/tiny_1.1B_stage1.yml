@@ -5,7 +5,7 @@ tokenizer_type: LlamaTokenizer
 is_llama_derived_model: true
 
 load_in_8bit: false
-load_in_4bit: true
+load_in_4bit: false
 strict: false
 
 datasets:
@@ -13,33 +13,13 @@ datasets:
     type: sharegpt
 dataset_prepared_path:
 val_set_size: 0 # 0.04
-output_dir: ./vicuna_7b_qlora_stage1
-
-adapter: qlora
-lora_model_dir:
-
-lora_r: 32
-lora_alpha: 16
-lora_dropout: 0.05
-lora_target_modules: 
-  - gate_proj
-  - down_proj
-  - up_proj
-  - q_proj
-  - v_proj
-  - k_proj
-  - o_proj
-  - lm_head
-lora_target_linear: 
-lora_fan_in_fan_out:
-lora_modules_to_save:
+output_dir: ./tiny_1.1B_stage1
 
 sequence_len: 4096
 sample_packing: true
-# eval_sample_packing: false
 pad_to_sequence_len: true
 
-wandb_project:
+wandb_project: medusa_test
 wandb_entity:
 wandb_watch:
 wandb_run_id:
@@ -59,8 +39,6 @@ fp16: false
 tf32: false
 
 gradient_checkpointing: true
-# gradient_checkpointing_kwargs:
-#   use_reentrant: true
 early_stopping_patience:
 resume_from_checkpoint:
 local_rank:
@@ -73,7 +51,7 @@ warmup_steps: 40
 save_steps:
 save_total_limit: 1
 debug:
-deepspeed: deepspeed_configs/zero3_bf16.json
+deepspeed:
 weight_decay: 0.0
 fsdp:
 fsdp_config:
@@ -81,7 +59,6 @@ special_tokens:
   bos_token: "<s>"
   eos_token: "</s>"
   unk_token: "<unk>"
-# max_steps: 1
 
 medusa_num_heads: 5
 medusa_num_layers: 1
